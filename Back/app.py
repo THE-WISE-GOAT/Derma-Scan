@@ -1,0 +1,166 @@
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image
+import io
+import datetime
+import httpx
+import os
+import base64
+import logging
+import traceback
+
+# ---- ML imports ----
+from yolo_detector import SkinDetector
+from severity_score import SeverityAnalyzer
+from rag_engine import SkinRAG
+
+# ---- App init ----
+app = FastAPI(title="GlowScan AI API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---- Ollama config ----
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+
+# ---- Load ML systems once (IMPORTANT) ----
+detector = SkinDetector(model_path="models/skin_trained.pt")
+analyzer = SeverityAnalyzer(model_path="models/severity_model_v1.pkl")
+rag_system = SkinRAG(persist_dir="chroma_db", pdf_dir="skin_docs")
+
+# -------------------------------------------------
+# Root health check
+# -------------------------------------------------
+@app.get("/")
+async def root():
+    return {"status": "GlowScan API running"}
+
+# -------------------------------------------------
+# Skin analysis (ML-powered)
+# -------------------------------------------------
+@app.post("/analyze")
+async def analyze_skin(
+    image: UploadFile = File(...),
+    user_query: str = Form("How can I treat this skin condition?")
+):
+    try:
+        image_bytes = await image.read()
+
+        # Validate image
+        try:
+            img = Image.open(io.BytesIO(image_bytes))
+            img.verify()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid image file")
+
+        # YOLO detection
+        detection_data = detector.predict(image_bytes)
+        if detection_data["count"] == 0:
+            return {
+                "status": "success",
+                "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "detected_conditions": [],
+                "severity_score": 0.0,
+                "recommendation": (
+                    "No visible skin issues detected. "
+                    "Maintain a basic skincare routine: gentle cleanser, moisturizer, and sunscreen."
+                ),
+                # expose both names so old / new clients keep working
+                "annotated_image": None,
+                "annotated_image_base64": None,
+            }
+
+        # Severity scoring
+        analysis = analyzer.calculate_score(detection_data["raw_result"])
+
+        # RAG recommendations
+        recommendation = rag_system.get_response(
+            question=user_query,
+            conditions=analysis["conditions"],
+            severity=analysis["score"]
+        )
+
+        # Convert annotated image to base64
+        annotated_base64 = base64.b64encode(
+            detection_data["annotated_image_bytes"]
+        ).decode("utf-8")
+
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        return {
+            "status": "success",
+            "timestamp": timestamp,
+            "detected_conditions": analysis["conditions"],
+            "severity_score": analysis["score"],
+            "recommendation": recommendation,
+            # keep original key and add the one your Flutter expects
+            "annotated_image": annotated_base64,
+            "annotated_image_base64": annotated_base64,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# -------------------------------------------------
+# Chat endpoint (Ollama + OpenRouter)
+# -------------------------------------------------
+@app.post("/chat")
+async def chat_proxy(request: dict):
+    model = request.get("model", "")
+    messages = request.get("messages", [])
+
+    if not messages:
+        raise HTTPException(status_code=400, detail="Messages required")
+
+    # ---- OpenRouter ----
+    if model == "openrouter":
+        api_key = request.get("apiKey") or os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=400, detail="API key required")
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                json={
+                    "model": "google/gemini-flash-1.5-exp:free",
+                    "messages": messages
+                },
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://glowscan.app",
+                    "X-Title": "GlowScan AI"
+                }
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return {"reply": data["choices"][0]["message"]["content"]}
+
+    # ---- Ollama ----
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={
+                "model": model or "qwen2.5:3b",
+                "messages": messages,
+                "stream": False
+            }
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return {"reply": data["message"]["content"]}
+
+# -------------------------------------------------
+# Local run
+# -------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
